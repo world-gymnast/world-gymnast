@@ -9,6 +9,7 @@
 **/playground
 **/wandb
 **/rollouts
+**/rollout_outputs
 /verl/utils/vla_utils/openvla_oft/robotwin/models/
 /verl/utils/vla_utils/openvla_oft/robotwin/aloha_maniskill_sim/
 
@@ -131,3 +132,5 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 logs
 log
 outputs
+*.out
+*.err

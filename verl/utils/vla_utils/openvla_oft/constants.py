@@ -66,6 +66,12 @@ BRIDGE_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+WORLDGYM_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 8,
+    "ACTION_DIM": 7,
+    "PROPRIO_DIM": 7,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
 
 # Function to detect robot platform from command line arguments
 def detect_robot_platform():
@@ -80,6 +86,7 @@ def detect_robot_platform():
             'ALOHA_8': 'ALOHA_8',
             'ALOHA_6': 'ALOHA_6',
             'BRIDGE': 'BRIDGE',
+            'WORLDGYM': 'WORLDGYM',
         }
         if robot_env in env_mapping:
             print(f"Detected robot platform from environment: {env_mapping[robot_env]}")
@@ -99,6 +106,8 @@ def detect_robot_platform():
         return "ALOHA"
     elif "bridge" in cmd_args:
         return "BRIDGE"
+    elif "worldgym" in cmd_args:
+        return "WORLDGYM"
     else:
         # TODO (cjh, fix): fix this to be more robust
         # Default to ALOHA if unclear
@@ -122,6 +131,8 @@ elif ROBOT_PLATFORM == "ALOHA_6":
     constants = ALOHA_CONSTANTS_6chunk   
 elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
+elif ROBOT_PLATFORM == "WORLDGYM":
+    constants = WORLDGYM_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]

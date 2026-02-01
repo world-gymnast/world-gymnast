@@ -292,8 +292,17 @@ class RayTrainer(object):
     def _create_dataloader(self):   # next fix
         from torch.utils.data import DataLoader
         # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.utils.dataset.rob_dataset import LIBERO_Dataset, Robotwin_Dataset, collate_fn
-        if "libero" in self.config.data.task_suite_name:
+        from verl.utils.dataset.rob_dataset import LIBERO_Dataset, WORLDGYM_Dataset, Robotwin_Dataset, collate_fn, TaskBatchSampler
+        if "worldgym" in self.config.data.task_suite_name:
+            self.train_dataset = WORLDGYM_Dataset(self.config.data.task_suite_name,
+                                                data_dir=self.config.data.data_dir + "/train",
+                                                num_trials_per_task=self.config.data.num_trials_per_task,
+                                                train_val ="train")
+            self.val_dataset = WORLDGYM_Dataset(self.config.data.task_suite_name,
+                                            data_dir=self.config.data.data_dir + "/test",
+                                            num_trials_per_task=self.config.data.num_trials_per_task,
+                                            train_val ="valid")
+        elif "libero" in self.config.data.task_suite_name:
             self.train_dataset = LIBERO_Dataset(self.config.data.task_suite_name,
                                                 num_trials_per_task=self.config.data.num_trials_per_task,
                                                 train_val ="train")
@@ -309,17 +318,49 @@ class RayTrainer(object):
         else:
             raise ValueError(f'Unsupported task suite name: {self.config.data.task_suite_name}')
 
-        self.train_dataloader = BufferedDataLoader(DataLoader(dataset=self.train_dataset,
-                                           batch_size=int(self.config.data.train_batch_size*self.config.data.oversample_factor),
-                                           shuffle=True,
-                                           drop_last=True,
-                                           collate_fn=collate_fn))
-        self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=self.config.data.val_batch_size,
-                                         shuffle=True,
-                                         drop_last=True,
-                                         collate_fn=collate_fn)
-
+        # Use TaskBatchSampler for WorldGym to ensure batches have the same instruction
+        if "worldgym" in self.config.data.task_suite_name:
+            train_batch_sampler = TaskBatchSampler(
+                self.train_dataset,
+                batch_size=int(self.config.data.train_batch_size*self.config.data.oversample_factor),
+                drop_last=True,
+                shuffle=True
+            )
+            val_batch_sampler = TaskBatchSampler(
+                self.val_dataset,
+                batch_size=self.config.data.val_batch_size,
+                drop_last=True,
+                shuffle=True
+            )
+            self.train_dataloader = BufferedDataLoader(DataLoader(
+                dataset=self.train_dataset,
+                batch_sampler=train_batch_sampler,
+                collate_fn=collate_fn,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True
+            ))
+            self.val_dataloader = DataLoader(
+                dataset=self.val_dataset,
+                batch_sampler=val_batch_sampler,
+                collate_fn=collate_fn
+            )
+        else:
+            # Original behavior for LIBERO and Robotwin
+            self.train_dataloader = BufferedDataLoader(DataLoader(
+                dataset=self.train_dataset,
+                batch_size=int(self.config.data.train_batch_size*self.config.data.oversample_factor),
+                shuffle=True,
+                drop_last=True,
+                collate_fn=collate_fn,
+            ))
+            self.val_dataloader = DataLoader(
+                dataset=self.val_dataset,
+                batch_size=self.config.data.val_batch_size,
+                shuffle=True,
+                drop_last=True,
+                collate_fn=collate_fn
+            )
         assert len(self.train_dataloader) >= 1
         assert len(self.val_dataloader) >= 1
 
@@ -525,7 +566,11 @@ class RayTrainer(object):
                             newbatch = DataProto.concat([buffer_batch, newbatch])
                             buffer_batch = []
 
-                        if "robotwin" in self.config.data.task_suite_name:
+                        if "worldgym" in self.config.data.task_suite_name:
+                            gen_batch = newbatch.select(batch_keys=['task_id', 'trial_id'],
+                                                        non_tensor_batch_keys={"task_suite_name", "trial_png", "instruction"},
+                                                        meta_info_keys={})
+                        elif "robotwin" in self.config.data.task_suite_name:
                             gen_batch = newbatch.select(batch_keys=['task_id', 'trial_id',"trial_seed"],
                                                         non_tensor_batch_keys={"task_suite_name"},
                                                         meta_info_keys={})

@@ -20,7 +20,7 @@ import pandas as pd
 
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from verl import DataProto
@@ -29,12 +29,76 @@ from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 import json
+import random
 
 try:
     from libero.libero import benchmark
 except ImportError as e:
     print(f"Warning : can't import libero: {e}")
-    
+
+try:
+    from world_model_eval import discover_trials
+except ImportError as e:
+    print(f"Warning : can't import world_model_eval: {e}")
+
+class TaskBatchSampler(Sampler):
+    """
+    A sampler that ensures each batch only contains trials from the same task_id.
+    This is crucial for WorldGym to avoid padding issues when different instructions
+    have different lengths.
+    """
+    def __init__(self, dataset, batch_size, drop_last=True, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+
+        # Group indices by task_id
+        self.task_groups = {}
+        for idx, item in enumerate(dataset.dataframe):
+            task_id = item['task_id'].item()
+            if task_id not in self.task_groups:
+                self.task_groups[task_id] = []
+            self.task_groups[task_id].append(idx)
+
+        self.task_ids = list(self.task_groups.keys())
+
+    def __iter__(self):
+        # Shuffle task order if needed
+        if self.shuffle:
+            task_order = random.sample(self.task_ids, len(self.task_ids))
+        else:
+            task_order = self.task_ids.copy()
+
+        batches = []
+        for task_id in task_order:
+            indices = self.task_groups[task_id].copy()
+            if self.shuffle:
+                random.shuffle(indices)
+
+            # Create batches from this task's trials
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+
+        # Shuffle the order of batches (but each batch still has same task_id)
+        if self.shuffle:
+            random.shuffle(batches)
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        count = 0
+        for task_id in self.task_ids:
+            n_samples = len(self.task_groups[task_id])
+            if self.drop_last:
+                count += n_samples // self.batch_size
+            else:
+                count += (n_samples + self.batch_size - 1) // self.batch_size
+        return count
+
 def collate_fn(data_list: list[dict]) -> dict:
     tensors = {}
     non_tensors = {}
@@ -101,6 +165,96 @@ class LIBERO_Dataset(Dataset):
         else:
             raise ValueError
      
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, item):
+        return self.dataframe[item]
+
+class WORLDGYM_Dataset(Dataset):
+    def __init__(self,
+                 task_suite_name,
+                 data_dir,
+                 num_trials_per_task=1,
+                 train_val="train",
+                 ):
+
+        self.task_suite_name = task_suite_name  
+        self.num_trials_per_task = num_trials_per_task  
+        self.train_val = train_val
+        self.data_dir = data_dir
+        self._read_files_and_tokenize()
+
+    def _read_files_and_tokenize(self):
+        trials = discover_trials(self.data_dir)
+        dataframes = []
+
+        if "worldgym" in self.task_suite_name:
+            # Group trials by instruction (similar to LIBERO grouping by task_id)
+            # This ensures batches have the same instruction, avoiding padding issues
+            instruction_groups = {}
+            for trial in trials:
+                instruction = trial["instruction"]
+                if instruction not in instruction_groups:
+                    instruction_groups[instruction] = []
+                instruction_groups[instruction].append(trial)
+
+            # Sort instructions for deterministic ordering
+            sorted_instructions = sorted(instruction_groups.keys())
+
+            # Assign task_id based on instruction groups
+            for task_id, instruction in enumerate(sorted_instructions):
+                trials_for_instruction = instruction_groups[instruction]
+
+                # Handle num_trials_per_task: repeat trials if needed
+                if self.train_val == "train":
+                    # If we need more trials than available, cycle through them
+                    if self.num_trials_per_task > len(trials_for_instruction):
+                        # Repeat trials to reach num_trials_per_task
+                        repeat_count = (self.num_trials_per_task + len(trials_for_instruction) - 1) // len(trials_for_instruction)
+                        trials_to_use = (trials_for_instruction * repeat_count)[:self.num_trials_per_task]
+                    else:
+                        # Use first num_trials_per_task trials
+                        trials_to_use = trials_for_instruction[:self.num_trials_per_task]
+                elif self.train_val == "valid":
+                    # Repeat trials if needed to meet minimum batch size requirement
+                    if self.num_trials_per_task > len(trials_for_instruction):
+                        # Repeat trials to reach num_trials_per_task (e.g., to match num_gpus)
+                        repeat_count = (self.num_trials_per_task + len(trials_for_instruction) - 1) // len(trials_for_instruction)
+                        trials_to_use = (trials_for_instruction * repeat_count)[:self.num_trials_per_task]
+                    else:
+                        # Use all available trials for validation
+                        trials_to_use = trials_for_instruction
+                else:
+                    raise ValueError(f"Invalid train_val: {self.train_val}")
+
+                # Each trial within this instruction group gets the same task_id
+                for trial_id, trial in enumerate(trials_to_use):
+                    data = {
+                        "task_suite_name": self.task_suite_name,
+                        "task_id": torch.tensor(task_id, dtype=torch.int64).unsqueeze(0),
+                        "trial_id": torch.tensor(trial_id, dtype=torch.int64).unsqueeze(0),
+                        "trial_seed": torch.tensor(-1, dtype=torch.int64).unsqueeze(0),
+                        "trial_png": trial["trial_png"],
+                        "instruction": trial["instruction"],
+                    }
+                    dataframes.append(data)
+
+            self.dataframe = dataframes
+            print(f'worldgym dataset len: {len(self.dataframe)}')
+            print(f'number of unique instructions (tasks): {len(sorted_instructions)}')
+            print(f'num_trials_per_task setting: {self.num_trials_per_task}')
+            print(f'train_val: {self.train_val}')
+            for task_id, instruction in enumerate(sorted_instructions):
+                available = len(instruction_groups[instruction])
+                if self.train_val == "train":
+                    used = min(self.num_trials_per_task, len([d for d in dataframes if d['task_id'].item() == task_id]))
+                    print(f'  Task {task_id}: "{instruction}" - {available} available, {used} used ({"repeated" if used > available else "subset"})')
+                else:
+                    print(f'  Task {task_id}: "{instruction}" - {available} trials (all used for validation)')
+        else:
+            raise ValueError
 
     def __len__(self):
         return len(self.dataframe)

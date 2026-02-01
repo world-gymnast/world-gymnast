@@ -65,8 +65,10 @@ class RayResourcePool(ResourcePool):
         if self.pgs is not None:
             return self.pgs
 
-        pg_name_prefix = name if name else \
-            f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
+        # Ensure unique placement group names across runs to avoid Ray name collisions
+        unique_suffix = get_random_string(length=6)
+        base_prefix = name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}"
+        pg_name_prefix = f"{base_prefix}:{unique_suffix}:"
         # print(f"pg_name_prefix = {pg_name_prefix}")
         pg_scheme = [[{
             "CPU": self.max_collocate_count,

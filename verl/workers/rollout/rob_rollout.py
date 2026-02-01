@@ -13,6 +13,7 @@
 # limitations under the License.
 import contextlib
 import os
+import math
 import torch
 import torch.distributed
 from tensordict import TensorDict
@@ -57,6 +58,7 @@ import gc
 from collections import defaultdict
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing.pool import ThreadPool
 import time
 from codetiming import Timer
 
@@ -453,6 +455,7 @@ class RobHFRollout(BaseRollout):
             "robotwin2_place_mouse_pad": 200,
             "robotwin2_place_shoe": 250,
             "robotwin2_move_pillbottle_pad": 200,
+            "worldgym_bridge": 40,
         }
         self.processor = AutoProcessor.from_pretrained(config.pretrained_checkpoint, trust_remote_code=True)
         self.vla_preprocess()
@@ -461,6 +464,13 @@ class RobHFRollout(BaseRollout):
         if "robotwin" in self.config.task_suite_name:
             self.env_thread_pool = ThreadPoolExecutor(max_workers=16)
             self.robotwin_version = self._detect_robotwin_version()
+        
+        # Setup world model for worldgym
+        if "worldgym" in self.config.task_suite_name:
+            from verl.utils.worldmodel_utils import load_world_model
+            wm_rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+            self.world_model = load_world_model(self.config.world_model, rank=wm_rank)
+            self.world_model.chunk_size = 1 # For step-by-step prediction
         
     def _detect_robotwin_version(self):
         """Detect which version of robotwin to use based on config"""
@@ -494,8 +504,10 @@ class RobHFRollout(BaseRollout):
             micro_batch_size = self.config.val_micro_batch_size if self.config.val_micro_batch_size is not None else 1
         else:
             micro_batch_size = self.config.get('micro_batch_size', batch_size)
-            
-        num_chunks = max(batch_size // micro_batch_size, 1)
+
+        num_chunks = max(1, math.ceil(batch_size / micro_batch_size))
+        num_chunks = min(num_chunks, batch_size)
+
         batch_prompts = prompts.chunk(chunks=num_chunks)
         output = [self._generate_minibatch(p) for p in batch_prompts]
         output = DataProto.concat(output)
@@ -596,7 +608,9 @@ class RobHFRollout(BaseRollout):
     
     def _generate_minibatch(self, prompts):
         """Generate minibatch - routes to appropriate implementation based on task suite"""
-        if "robotwin" in self.config.task_suite_name:
+        if "worldgym" in self.config.task_suite_name:
+            return self._generate_minibatch_worldgym(prompts)
+        elif "robotwin" in self.config.task_suite_name:
             return self._generate_minibatch_robotwin(prompts)
         else:
             return self._generate_minibatch_libero(prompts)
@@ -767,6 +781,189 @@ class RobHFRollout(BaseRollout):
         self.module.train()
         
         # Prepare output batch
+        return self._prepare_output_batch(vla_history, task_records, batch_size)
+
+    def _generate_minibatch_worldgym(self, prompts):
+        """Generate minibatch for WorldGym using batched world model simulation"""
+        from verl.utils.worldmodel_utils import load_png_to_tensor, worldmodel_frame_to_vla_input, pad_and_rescale_action, predict
+
+        self.module.eval()
+        meta_info = prompts.meta_info
+        n_samples = meta_info.get('n_samples', 1)
+        is_valid = meta_info.get('n_samples') is None
+        global_steps = meta_info.get('global_steps', 0) if is_valid else 0
+        task_id = prompts.batch['task_id'].repeat_interleave(n_samples, dim=0)
+        trial_id = prompts.batch['trial_id'].repeat_interleave(n_samples, dim=0)
+        task_suite_name = np.repeat(prompts.non_tensor_batch['task_suite_name'], n_samples)
+
+        # Get PNG paths and instructions from prompts
+        trial_png_paths = np.repeat(prompts.non_tensor_batch['trial_png'], n_samples)
+        instructions = np.repeat(prompts.non_tensor_batch['instruction'], n_samples)
+
+        max_steps = self.max_steps[self.config.task_suite_name]
+        batch_size = task_id.size(0)
+
+        # Load initial frames for all rollouts in batch
+        def load_frame_helper(png_path, target_size=256):
+            """Helper function for parallel loading."""
+            return load_png_to_tensor(png_path, target_size=target_size)
+
+        with ThreadPool(processes=min(batch_size, 32)) as pool:
+            initial_frames = pool.starmap(
+                load_frame_helper,
+                [(png_path, 256) for png_path in trial_png_paths]
+            )
+        initial_frames = torch.stack(initial_frames, dim=0)  # Shape: (batch_size, H, W, C)
+
+        # Reset world model with batch of initial frames
+        initial_frames_gpu = initial_frames.cuda(non_blocking=True)
+        self.world_model.reset(initial_frames_gpu)
+
+        # Store all generated frames for each rollout
+        all_frames = [[frame.cpu().numpy()] for frame in initial_frames]  # List of lists
+
+        # Prepare initial VLA inputs
+        inputs = []
+        task_descriptions = list(instructions)
+        for i in range(batch_size):
+            obs_dict = {
+                "full_image": (initial_frames[i].numpy() * 255).astype(np.uint8),
+            }
+            inputs.append(obs_dict)
+
+        step = 0
+        vla_history = []
+
+        # Rollout loop
+        while step < max_steps:
+            # Process VLA input for current observations
+            vla_input = self.process_input(inputs, task_descriptions)
+            vla_input.update(meta_info)
+            vla_output = self._generate_one_step(vla_input)
+            actions = vla_output["action"]  # Shape: (batch_size, action_dim)
+
+            # Store VLA step data
+            step_data = {
+                "responses": vla_output["responses"],
+                "input_ids": vla_output["input_ids"],
+                "attention_mask": vla_output["attention_mask"],
+                "pixel_values": vla_output["pixel_values"],
+                "action": actions,
+                "step": step
+            }
+            vla_history.append(step_data)
+
+            # Process actions sequentially through world model
+            # VLA generates chunk of actions: (batch_size, num_chunks, action_dim)
+            # We process each action one by one, storing all generated frames
+            batch_size_check, num_chunks, action_dim = actions.shape
+
+            # Generate frames by processing each action sequentially
+            generated_frames = []
+
+            for chunk_idx in range(num_chunks):
+                # Extract single action: (batch_size, 1, action_dim)
+                single_action = actions[:, chunk_idx:chunk_idx+1, :]
+
+                # Pad and rescale
+                rescaled_action = pad_and_rescale_action(single_action)  # (batch_size, 1, 10)
+
+                # Generate frame from world model for this single action
+                # generate_chunk yields (frame_idx, frames) - should be just one frame since chunk_size=1
+                for frame_idx, frames in self.world_model.generate_chunk(rescaled_action):
+                    generated_frames.append(frames)  # Each is (batch_size, 1, H, W, C)
+
+            # Use the last generated frame as the next observation
+            next_frames_batch = generated_frames[-1]  # Shape: (batch_size, 1, H, W, C)
+
+            # Update inputs with new frames
+            new_inputs = []
+            for i in range(batch_size):
+                # Convert world model frame to VLA input
+                obs_dict = worldmodel_frame_to_vla_input(next_frames_batch[i:i+1])
+                new_inputs.append(obs_dict)
+
+                # Store all intermediate frames for video generation
+                for frame_batch in generated_frames:
+                    frame_np = frame_batch[i, 0].cpu().numpy()
+                    all_frames[i].append(frame_np)
+
+            inputs = new_inputs
+            step += self.config.action_chunks_len
+
+        # Evaluate rollouts with GPT-4o to get rewards
+        def evaluate_single_rollout(i, all_frames_list, instructions_list, task_id_tensor, trial_id_tensor, max_steps):
+            """Helper function to evaluate a single rollout."""
+            try:
+                # Stack frames into video: (T, H, W, C) in uint8 format
+                video_frames = np.stack(all_frames_list[i], axis=0)
+                video_uint8 = np.clip(video_frames * 255, 0, 255).astype(np.uint8)
+
+                # Prepare trial dict for GPT evaluation
+                trial_dict = {
+                    "instruction": instructions_list[i],
+                    "partial_criteria": None
+                }
+
+                # Get GPT reward (0.0 or 1.0)
+                reward_score = predict(video_uint8, trial_dict, n=5)
+
+                # Record task completion
+                return {
+                    "active": False,
+                    "complete": reward_score >= 1.0,
+                    "finish_step": max_steps,
+                    "task_file_name": f"task_{task_id_tensor[i].item()}_trial_{trial_id_tensor[i].item()}",
+                    "index": i
+                }
+            except Exception as e:
+                print(f"Error evaluating rollout {i}: {e}", flush=True)
+                return {
+                    "active": False,
+                    "complete": False,
+                    "finish_step": max_steps,
+                    "task_file_name": f"task_{task_id_tensor[i].item()}_trial_{trial_id_tensor[i].item()}",
+                    "index": i
+                }
+
+        # Parallel evaluation using thread pool - parallelize entire batch
+        task_records_dict = {}
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = {
+                executor.submit(
+                    evaluate_single_rollout,
+                    i, all_frames, instructions, task_id, trial_id, max_steps
+                ): i
+                for i in range(batch_size)
+            }
+
+            # Collect results as they complete
+            for future in as_completed(futures):
+                result = future.result()
+                task_records_dict[result["index"]] = result
+
+        # Sort by original order
+        task_records = [task_records_dict[i] for i in range(batch_size)]
+
+        # Save validation videos for evaluation runs
+        if is_valid:
+            for i, record in enumerate(task_records):
+                task_file = record["task_file_name"]
+                frames_uint8 = [
+                    np.clip(frame * 255, 0, 255).astype(np.uint8) for frame in all_frames[i]
+                ]
+                save_rollout_video(
+                    frames_uint8,
+                    self.config.experiment_name,
+                    task_file,
+                    global_steps,
+                    record["complete"]
+                )
+
+        torch.cuda.empty_cache()
+        self.module.train()
+
+        # Prepare output batch (reward manager will convert complete flag to rewards)
         return self._prepare_output_batch(vla_history, task_records, batch_size)
     
     def _generate_minibatch_libero(self, prompts):
