@@ -19,10 +19,33 @@ See [SETUP.md](SETUP.md) for environment setup and dependencies.
 Example training script:
 - `examples/run_openvla_oft_rl_worldgym.sh`
 
+## Data
+
+Training data is stored as JSON annotations plus PNG images.
+
+Example JSON:
+```json
+{"instruction": "lift eggplant", "partial_credit_criteria": "the robot makes contact with the eggplant"}
+```
+
 ## Project Website
 
 https://world-gymnast.github.io/
 
+## Paper
+
+https://arxiv.org/abs/2602.02454
+
 ## Citation
 
-BibTeX coming soon.
+```bibtex
+@misc{sharma2026worldgymnasttrainingrobotsreinforcement,
+      title={World-Gymnast: Training Robots with Reinforcement Learning in a World Model},
+      author={Ansh Kumar Sharma and Yixiang Sun and Ninghao Lu and Yunzhe Zhang and Jiarao Liu and Sherry Yang},
+      year={2026},
+      eprint={2602.02454},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2602.02454},
+}
+```
