@@ -49,3 +49,8 @@ https://arxiv.org/abs/2602.02454
       url={https://arxiv.org/abs/2602.02454},
 }
 ```
+
+## Acknowledgements
+- [WorldGym](https://github.com/world-model-eval/world-model-eval)
+- [SimpleVLA-RL](https://github.com/PRIME-RL/SimpleVLA-RL)
+- [OpenVLA-OFT](https://github.com/moojink/openvla-oft)
